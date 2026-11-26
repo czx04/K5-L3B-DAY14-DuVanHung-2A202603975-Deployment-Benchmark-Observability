@@ -402,7 +402,87 @@ Dọn stack: `docker compose -p k5-day14-docker down -v`.
 
 ## Part 3: Cloud Deployment
 
-_(chưa làm)_
+Theo lưu ý K5, Part 3 làm **sau** Part 6, và deploy luôn agent của Part 6 (`06-lab-complete/`) thay vì app mẫu trong `03-cloud-deployment/`. Nền tảng chính là **Render** (Exercise 3.2). Thông tin chi tiết nằm trong [DEPLOYMENT.md](DEPLOYMENT.md).
+
+### Exercise 3.2: Deploy Render (nền tảng chính)
+
+- **URL:** https://day14-agent-af0r.onrender.com
+- **Cách deploy:**
+  1. Push code lên GitHub.
+  2. Trên Render: New → Blueprint, chọn repo, đặt Blueprint Path là `06-lab-complete/render.yaml`.
+  3. Render đọc Blueprint và tạo 2 resource: Key Value `day14-redis` và Web Service `day14-agent` (`runtime: docker`, `rootDir: 06-lab-complete`).
+  4. Nhập `AGENT_API_KEY` trên dashboard.
+- **Biến môi trường:**
+  - `AGENT_API_KEY` khai báo `sync: false`, giá trị nhập trên dashboard.
+  - `REDIS_URL` lấy tự động bằng `fromService` (`connectionString` của Key Value).
+  - `ENVIRONMENT`, `RATE_LIMIT_PER_MINUTE`, `DAILY_BUDGET_USD`, `MONTHLY_BUDGET_USD`, `WEB_CONCURRENCY` ghi trực tiếp trong `render.yaml`.
+  - `PORT=10000` do Render tự cấp.
+  - Không có secret nào trong git.
+- **Xem log:** mở tab Logs của service. App ghi log dạng JSON nên dễ lọc:
+
+  ```text
+  {"ts": "2026-11-26T08:03:43.339+00:00", "lvl": "INFO", "logger": "agent", "event": "startup", "version": "1.0.0", "environment": "production", "rate_limit_per_minute": 10, "daily_budget_usd": 1.0, "monthly_budget_usd": 10.0, "redis_ok": true}
+  INFO:     Uvicorn running on http://0.0.0.0:10000 (Press CTRL+C to quit)
+  ==> Your service is live 🎉
+  ```
+
+- **Sự cố khi deploy lần đầu:** service crash với lỗi `RuntimeError: AGENT_API_KEY is not set`, vì `sync: false` nghĩa là Render không tự sinh giá trị. Đây là hành vi **fail fast** cố ý của `config.py`: thà không khởi động còn hơn chạy mà không có xác thực. Đặt biến trên dashboard rồi deploy lại thì service chuyển sang Live.
+- **Kiểm tra URL public** (từ máy local, lúc 2026-11-26 08:04 UTC):
+
+  | Request | HTTP |
+  |---|---|
+  | `GET /health` | 200 |
+  | `GET /ready` | 200 `{"ready":true}` (Redis trên Render đã kết nối) |
+  | `POST /ask` không có key | 401 |
+  | `POST /ask` với key sai | 401 |
+  | `POST /ask` với key đúng | **200** (xem `screenshots/test.png`; 4 lệnh CP6 ra `200 200 401 200`) |
+  | `GET /docs` | 404 (Swagger bị tắt khi chạy production) |
+
+  Chạy `python check_production_ready.py --public-url https://day14-agent-af0r.onrender.com` ra `✅ Public URL: GET .../health → 200`.
+- **Ảnh chụp:** [dashboard](screenshots/dashboard.png) · [running](screenshots/running.png) · [test](screenshots/test.png)
+
+### Exercise 3.1 / "nền tảng còn lại": so sánh `railway.toml` và `render.yaml`
+
+So sánh trên cả hai bản: bản mẫu trong `03-cloud-deployment/` và bản mình viết trong `06-lab-complete/`.
+
+| Khía cạnh | `railway.toml` | `render.yaml` | Vì sao khác |
+|---|---|---|---|
+| **Phạm vi** | Cấu hình build và deploy của **một service**. Project, database và biến môi trường tạo bằng dashboard hoặc CLI (`railway add`, `railway variables`) | **Blueprint** (Infrastructure as Code) của **cả hệ thống**: khai báo nhiều resource trong một file (web service và Key Value) | Railway coi file là "config-as-code" cho từng service. Render dùng Blueprint để dựng toàn bộ hạ tầng từ git |
+| **Định dạng** | TOML: `[build]`, `[deploy]` | YAML: danh sách `services:` | |
+| **Cách build** | `builder = "DOCKERFILE"` (bản của mình) hoặc `"NIXPACKS"` (bản mẫu, tự nhận diện project Python) | `runtime: docker` + `dockerfilePath` + `rootDir` (bản của mình), hoặc `runtime: python` + `buildCommand: pip install ...` (bản mẫu) | Cả hai đều hỗ trợ build từ Dockerfile hoặc tự build. Mình chọn Docker cho cả hai để môi trường giống hệt lúc chạy local và lúc chấm bài |
+| **Lệnh chạy** | Bản mẫu có `startCommand = "uvicorn app:app --port $PORT"`. Bản của mình không có, vì dùng `CMD` trong Dockerfile | Bản mẫu có `startCommand`. Bản của mình không có, cũng dùng `CMD` | Khi build bằng Docker thì Dockerfile là nguồn duy nhất của lệnh chạy, tránh hai nơi khai báo lệch nhau |
+| **Health check** | `healthcheckPath = "/health"`, `healthcheckTimeout = 30`. Railway chỉ kiểm tra **lúc deploy** để quyết định có chuyển traffic sang bản mới hay không | `healthCheckPath: /health`. Render kiểm tra cả lúc deploy (zero-downtime) **và liên tục** khi đang chạy | Ngữ nghĩa khác nhau, nhưng đều cần `/health` trả 200 mà không phụ thuộc Redis |
+| **Restart** | `restartPolicyType = "ON_FAILURE"`, `restartPolicyMaxRetries = 3` | Không có trường riêng, Render tự restart khi health check fail hoặc process crash | |
+| **Biến môi trường / secret** | **Không khai báo trong file**: dùng `railway variables set KEY=...` hoặc dashboard. Redis tham chiếu bằng `${{Redis.REDIS_URL}}` | Khai báo trong `envVars`: giá trị thường dùng `value:`, secret dùng `sync: false` (nhập trên dashboard) hoặc `generateValue: true` (Render tự sinh, bản mẫu dùng cho `AGENT_API_KEY`), tham chiếu resource khác dùng `fromService` | Render đưa *danh sách* biến vào git nhưng không đưa *giá trị* secret. Railway để toàn bộ biến ngoài git |
+| **Redis** | Thêm plugin Redis bằng dashboard hoặc `railway add`, không có trong `railway.toml` | Khai báo ngay trong file: `type: keyvalue` (bản mẫu dùng `type: redis`, tên cũ đã deprecated) kèm `plan`, `ipAllowList`, `maxmemoryPolicy` | |
+| **Region, plan, auto-deploy** | Chọn trên dashboard | Ghi trong file: `region: singapore`, `plan: free`, `autoDeploy: true` | |
+| **Port** | Railway cấp `$PORT` | Render cấp `$PORT` (thực tế là `10000`) | Vì vậy `CMD` dùng `${PORT:-8000}` để chạy được ở cả hai nền tảng và ở local |
+
+Các lỗi trong file `render.yaml` mẫu (`03-cloud-deployment/render/`):
+- `type: redis` đã deprecated, nay là `keyvalue`. Key Value bắt buộc có `ipAllowList` mà file mẫu không khai báo.
+- Service Redis không được nối vào web service: không có `REDIS_URL` dùng `fromService`.
+- `maxmemoryPolicy: allkeys-lru` không phù hợp nếu Redis lưu state của rate limit hay cost guard, vì Redis có thể tự xoá bộ đếm khi đầy bộ nhớ. Bản của mình dùng `noeviction`.
+
+### Exercise 3.3: Cloud Run CI/CD (đọc `cloudbuild.yaml` và `service.yaml`)
+
+Pipeline `cloudbuild.yaml` (Cloud Build tự chạy khi push lên `main`) gồm 4 bước chạy nối tiếp nhau bằng `waitFor`:
+1. **test**: dùng image `python:3.11-slim`, `pip install -r requirements.txt pytest` rồi chạy `pytest tests/`. Test fail thì pipeline dừng, không build.
+2. **build**: `docker build` gắn 2 tag `gcr.io/$PROJECT_ID/ai-agent:$COMMIT_SHA` và `:latest`, với `--cache-from :latest` để dùng lại layer cache.
+3. **push**: đẩy cả hai tag lên Container Registry.
+4. **deploy**: `gcloud run deploy ai-agent --image ...:$COMMIT_SHA`, region `asia-southeast1`, public (`--allow-unauthenticated`), tối thiểu 1 instance để tránh cold start, tối đa 10 instance, 512Mi RAM / 1 CPU, timeout 60 giây. `ENVIRONMENT` đặt bằng env, `OPENAI_API_KEY` lấy từ **Secret Manager** (`--set-secrets`).
+
+`service.yaml` là bản mô tả khai báo (Knative) của cùng service đó, deploy bằng `gcloud run services replace`:
+- Autoscale từ 1 đến 10 instance, `containerConcurrency: 80`.
+- Mỗi container request 0.5 CPU / 256Mi, limit 1 CPU / 512Mi.
+- Secret (`OPENAI_API_KEY`, `AGENT_API_KEY`) lấy từ Secret Manager bằng `secretKeyRef`.
+- `livenessProbe` gọi `/health`, `startupProbe` gọi `/ready`.
+
+Những điểm chưa ổn nếu dùng thật:
+- Repo không có thư mục `tests/`, nên `pytest` báo "no tests ran" (exit code 5) và **pipeline fail ngay bước 1**.
+- `cloudbuild.yaml` không truyền `AGENT_API_KEY`, trong khi `service.yaml` có.
+- `service.yaml` dùng tag `:latest` còn pipeline dùng `$COMMIT_SHA`, nên hai cách deploy có thể chạy hai phiên bản khác nhau.
+- Container Registry `gcr.io` đã được thay bằng Artifact Registry.
+- Đặt `minScale: 1` nghĩa là luôn tốn tiền cho một instance, kể cả khi không có traffic.
 
 ## Part 4: API Security
 
@@ -1026,3 +1106,4 @@ Một dòng log mẫu (JSON, không chứa API key hay nội dung câu hỏi):
 | Part 4 | Dùng Claude Code chạy bản develop và production của `04-api-gateway`, thử API key, JWT, rate limit, role; viết `check_budget` bằng Redis | Output 401/403/200/429, phân tích thuật toán rate limit, bản cài cost guard dùng Lua atomic | Gửi 20 request thật để thấy 429 ở request thứ 11. Decode payload JWT để kiểm tra `exp - iat = 3600`. Chạy test cost guard trên container Redis thật, gồm cả test race 100 request song song so với đáp án mẫu (66 so với 71 request được chấp nhận). |
 | Part 5 | Dùng Claude Code chạy bản develop (health, ready, SIGTERM khi đang có request) và stack 3 instance, chạy `test_stateless.py`, kill một instance | Output health/ready, bằng chứng graceful shutdown, phân bổ round-robin, kết quả test stateless, phân tích lỗi event loop bị chặn và timeout 60 giây của Nginx | Đo thời gian thật bằng `curl -w %{time_total}`. Đếm request trong `docker compose logs`. Đối chiếu log Nginx `upstream timed out` với IP của instance đã tắt. Dùng override cổng 8081 vì cổng 8080 bị một container khác chiếm, không sửa file của đề. |
 | Part 6 | Dùng Claude Code viết code cho các TODO trong `06-lab-complete/` (config, auth, rate limiter Redis + Lua, cost guard Redis, main.py, Dockerfile, compose, render.yaml, railway.toml), chạy script chấm tới khi PASS | Code hoàn chỉnh, PASS 12/12 (43/43 checks) | Đọc toàn bộ `check_production_ready.py` để hiểu tiêu chí, không sửa script. Lần đầu fail graceful shutdown: đọc `uvicorn/server.py` (`capture_signals`), tìm ra handler bị đè và sửa. Test thêm bằng `docker compose`: 401/200/429/422/503, tắt Redis thì `/ready` trả 503, kiểm tra PID 1 và user trong container. Chạy lại script đầy đủ sau mỗi lần sửa. |
+| Part 3 | Dùng Claude Code viết `render.yaml` (tra spec Blueprint của Render: `dockerfilePath` tính tương đối với `rootDir`, `type: keyvalue`, `ipAllowList` bắt buộc), kiểm tra URL public, so sánh config các nền tảng, đọc pipeline Cloud Run | `render.yaml` hoàn chỉnh, `DEPLOYMENT.md`, bảng so sánh, mô tả pipeline | Tự tạo Blueprint trên Render và tự nhập `AGENT_API_KEY` (key không đi qua AI). Đọc log lỗi lần deploy đầu (thiếu key) để sửa. Tự chạy 4 lệnh CP6 bằng key thật. AI chỉ kiểm tra các endpoint không cần key và chạy `--public-url`. |
